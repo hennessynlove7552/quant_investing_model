@@ -3,7 +3,7 @@
 Quantitative Investment Model - 웹 앱
 
 Streamlit 기반 웹 인터페이스.
-교육용 정량 투자 모델을 브라우저에서 실행합니다.
+정량 투자 분석을 브라우저에서 실행합니다. 개인 실전 활용용.
 
 실행: streamlit run app.py
 """
@@ -16,6 +16,7 @@ matplotlib.use("Agg")  # headless 백엔드
 import matplotlib.pyplot as plt
 
 try:
+    from data_providers import get_provider_names
     from quant_investing_model import (
         download_data,
         calculate_metrics,
@@ -137,18 +138,33 @@ def main():
         return
 
     st.title("📈 Quantitative Investment Model")
-    st.caption("교육용 정량 투자 분석 도구")
+    st.caption("정량 투자 분석 · 개인 실전 활용용")
 
     st.markdown("""
     <div class="disclaimer">
-        ⚠️ <strong>면책 조항</strong>: 이 도구는 교육 목적으로만 제공됩니다.
-        실제 투자 조언을 제공하지 않으며, 실제 거래에 사용해서는 안 됩니다.
+        ⚠️ <strong>면책</strong>: 투자 자문·매매 권유가 아니며, 결과에 따른 의사결정과 손익은 전적으로 본인 책임입니다.
     </div>
     """, unsafe_allow_html=True)
 
     # 사이드바: 입력 파라미터
     with st.sidebar:
         st.header("⚙️ 분석 설정")
+
+        provider = st.selectbox(
+            "데이터 소스",
+            options=get_provider_names(),
+            index=0,
+            help="yfinance는 키 불필요. 나머지는 API 키가 필요할 수 있습니다.",
+        )
+        api_keys = None
+        if provider != "yfinance":
+            api_key_val = st.text_input(
+                f"API 키 ({provider})",
+                type="password",
+                help="비워두면 환경 변수 사용 (예: ALPHAVANTAGE_API_KEY)",
+            )
+            if api_key_val.strip():
+                api_keys = {provider: api_key_val.strip()}
 
         ticker_input = st.text_input(
             "자산 티커 (쉼표 구분)",
@@ -245,7 +261,9 @@ def main():
     # 분석 실행
     with st.spinner("데이터를 불러오는 중..."):
         try:
-            prices = download_data(tickers, start_str, end_str)
+            prices = download_data(
+                tickers, start_str, end_str, provider=provider, api_keys=api_keys
+            )
         except (ValueError, ConnectionError) as e:
             st.error(f"데이터 다운로드 실패: {e}")
             return
@@ -326,7 +344,7 @@ def main():
                 st.text(res["summary"])
 
     st.divider()
-    st.caption("Quantitative Investment Model · 교육용")
+    st.caption("Quantitative Investment Model · 개인 실전 활용")
 
 
 if __name__ == "__main__":

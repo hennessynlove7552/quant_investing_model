@@ -23,6 +23,11 @@ import yfinance as yf
 from statsmodels.regression.linear_model import OLS
 from statsmodels.tools import add_constant
 
+from data_providers import (
+    fetch_prices,
+    get_provider_names,
+)
+
 
 # =============================================================================
 # 1. 데이터 다운로드
@@ -33,12 +38,15 @@ def download_data(
     tickers: list[str],
     start_date: str,
     end_date: str,
+    provider: str = "yfinance",
+    api_keys: Optional[dict] = None,
 ) -> pd.DataFrame:
     """
-    yfinance를 사용해 지정 기간의 조정 종가(Adjusted Close)를 다운로드합니다.
+    지정 기간의 조정 종가(또는 종가)를 선택한 데이터 프로바이더로 다운로드합니다.
 
-    조정 종가는 배당·주식분할 등을 반영한 가격으로,
-    수익률 계산 시 일관된 시계열을 제공합니다.
+    프로바이더: yfinance, alpha_vantage, financial_modeling_prep, eodhd,
+    polygon, finnhub, barchart, quodd, databento.
+    API 키는 api_keys dict 또는 환경 변수(ALPHAVANTAGE_API_KEY 등)로 전달.
 
     Parameters
     ----------
@@ -48,41 +56,33 @@ def download_data(
         시작일 (YYYY-MM-DD)
     end_date : str
         종료일 (YYYY-MM-DD)
+    provider : str
+        데이터 소스 (기본: yfinance)
+    api_keys : dict, optional
+        { "alpha_vantage": "KEY", "fmp": "KEY", ... }
 
     Returns
     -------
     pd.DataFrame
-        날짜 인덱스, 티커별 조정 종가 컬럼
-
-    Raises
-    ------
-    ValueError
-        유효한 데이터가 없거나 모든 티커가 실패한 경우
+        날짜 인덱스, 티커별 조정 종가(또는 종가) 컬럼
     """
     if not tickers:
         raise ValueError("티커 목록이 비어 있습니다.")
+    if provider not in get_provider_names():
+        raise ValueError(f"지원하지 않는 프로바이더: {provider}. 사용 가능: {get_provider_names()}")
 
-    # 티커별로 조정 종가 수집 (구조 호환성 확보)
     dfs = []
     for t in tickers:
-        data = yf.download(
-            t,
-            start=start_date,
-            end=end_date,
-            progress=False,
-            auto_adjust=True,
-        )
-        if data.empty:
-            continue
-        close = data["Close"] if "Close" in data.columns else data.iloc[:, 3]
-        close = close.rename(t)
-        dfs.append(close)
+        series = fetch_prices(provider, t, start_date, end_date, api_keys=api_keys)
+        if series is not None and not series.empty:
+            series.index = pd.to_datetime(series.index).tz_localize(None)
+            dfs.append(series)
     if not dfs:
         raise ValueError(
-            f"다운로드된 데이터가 없습니다. 티커({tickers})와 날짜({start_date}~{end_date})를 확인하세요."
+            f"다운로드된 데이터가 없습니다. 티커({tickers}), 날짜({start_date}~{end_date}), "
+            f"프로바이더({provider}) 및 API 키를 확인하세요."
         )
     result = pd.concat(dfs, axis=1)
-    result.index = pd.to_datetime(result.index).tz_localize(None)
     result = result.dropna(how="all")
 
     if result.empty or result.shape[1] == 0:
@@ -90,9 +90,7 @@ def download_data(
             f"다운로드된 데이터가 없습니다. 티커({tickers})와 날짜({start_date}~{end_date})를 확인하세요."
         )
 
-    # 결측치가 과도한 티커 제거
     result = result.dropna(axis=1, thresh=int(len(result) * 0.5))
-
     return result
 
 
@@ -560,7 +558,18 @@ def main() -> None:
         print(f"오류: {e}")
         return
 
-    # 3) 무위험 수익률
+    # 3) 데이터 프로바이더
+    providers = get_provider_names()
+    print(f"데이터 소스: {', '.join(providers)}")
+    provider_input = input("데이터 소스 (기본 yfinance): ").strip().lower() or "yfinance"
+    provider = provider_input if provider_input in providers else "yfinance"
+    api_keys = None
+    if provider != "yfinance":
+        key_input = input(f"  API 키 ({provider}, 비워두면 환경변수): ").strip()
+        if key_input:
+            api_keys = {provider: key_input}
+
+    # 4) 무위험 수익률
     rf_input = input("연간 무위험 수익률 (예: 0.03 = 3%): ").strip() or "0.03"
     try:
         risk_free_rate = float(rf_input)
@@ -568,7 +577,7 @@ def main() -> None:
         print("오류: 숫자를 입력하세요 (예: 0.03)")
         return
 
-    # 4) VaR 신뢰수준 (선택)
+    # 5) VaR 신뢰수준 (선택)
     var_choice = input("VaR 계산 여부 (y/n, 기본 n): ").strip().lower() or "n"
     var_confidence = 0.95
     if var_choice == "y":
@@ -578,10 +587,10 @@ def main() -> None:
         except ValueError:
             var_confidence = 0.95
 
-    # 5) 팩터 모델 실행 여부
+    # 6) 팩터 모델 실행 여부
     factor_choice = input("Fama-French 3-팩터 분석 실행 (y/n, 기본 y): ").strip().lower() or "y"
 
-    # 6) 비용·세금·미시구조 반영 (선택)
+    # 7) 비용·세금·미시구조 반영 (선택)
     cost_choice = input("거래비용·슬리피지·스프레드·세금 반영 (y/n, 기본 n): ").strip().lower() or "n"
     transaction_cost_pct = slippage_pct = spread_pct = tax_rate = 0.0
     if cost_choice == "y":
@@ -595,8 +604,10 @@ def main() -> None:
 
     # --- 실행 ---
     try:
-        print("\n데이터 다운로드 중...")
-        prices = download_data(tickers, start_date, end_date)
+        print(f"\n데이터 다운로드 중 ({provider})...")
+        prices = download_data(
+            tickers, start_date, end_date, provider=provider, api_keys=api_keys
+        )
         print(f"다운로드 완료: {list(prices.columns)}")
 
         returns = prices.pct_change().dropna()
