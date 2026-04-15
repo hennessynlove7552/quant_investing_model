@@ -16,17 +16,40 @@ matplotlib.use("Agg")  # headless 백엔드
 import matplotlib.pyplot as plt
 
 try:
-    from data_providers import get_provider_names
+    from data_providers import (
+        get_provider_env_key,
+        get_provider_names,
+        normalize_provider_name,
+    )
+    from market_data_store import (
+        MarketDataStore,
+        get_default_market_data_store_path,
+    )
     from quant_investing_model import (
         download_data,
+        download_data_with_volume,
         calculate_metrics,
         calculate_var,
         download_fama_french_factors,
         run_factor_model,
+        THGNN_DEPS_OK,
     )
+    from prediction_hub import (
+        run_stock_prediction,
+        prediction_model_ids,
+        prediction_model_descriptions,
+    )
+
     DEPS_OK = True
+    try:
+        import sklearn  # noqa: F401
+
+        SKLEARN_OK = True
+    except ImportError:
+        SKLEARN_OK = False
 except ImportError as e:
     DEPS_OK = False
+    SKLEARN_OK = False
     IMPORT_ERROR = str(e)
 
 # 페이지 설정
@@ -156,15 +179,19 @@ def main():
             index=0,
             help="yfinance는 키 불필요. 나머지는 API 키가 필요할 수 있습니다.",
         )
+        normalized_provider = normalize_provider_name(provider)
+        provider_env_key = get_provider_env_key(normalized_provider)
         api_keys = None
         if provider != "yfinance":
             api_key_val = st.text_input(
                 f"API 키 ({provider})",
                 type="password",
-                help="비워두면 환경 변수 사용 (예: ALPHAVANTAGE_API_KEY)",
+                help=f"비워두면 환경 변수 사용 ({provider_env_key})",
             )
             if api_key_val.strip():
-                api_keys = {provider: api_key_val.strip()}
+                api_keys = {normalized_provider: api_key_val.strip()}
+            elif provider_env_key:
+                st.caption(f"입력값이 없으면 `{provider_env_key}` 환경 변수를 사용합니다.")
 
         ticker_input = st.text_input(
             "자산 티커 (쉼표 구분)",
@@ -241,6 +268,34 @@ def main():
         run_factor = st.checkbox("Fama-French 3-팩터 분석", value=True)
 
         st.divider()
+        with st.expander("🗄️ 로컬 데이터 저장소", expanded=False):
+            use_local_store = st.checkbox(
+                "로컬 저장소 사용",
+                value=True,
+                help="다운로드한 가격/거래량 데이터를 SQLite에 저장해 이후 분석에서 재사용합니다.",
+            )
+            force_refresh = st.checkbox(
+                "이번 실행은 강제 새로고침",
+                value=False,
+                help="저장소 데이터를 무시하고 외부 프로바이더에서 다시 받아옵니다.",
+            )
+            store_path = st.text_input(
+                "저장소 경로",
+                value=get_default_market_data_store_path(),
+                help="SQLite 파일 경로",
+            )
+            if use_local_store:
+                try:
+                    store_summary = MarketDataStore(store_path).summary()
+                    st.caption(
+                        f"저장 rows={store_summary['rows']}, "
+                        f"instruments={store_summary['instruments']}, "
+                        f"range={store_summary['min_date'] or '-'} ~ {store_summary['max_date'] or '-'}"
+                    )
+                except Exception as e:
+                    st.caption(f"저장소 상태 확인 실패: {e}")
+
+        st.divider()
         analyze_btn = st.button("🔍 분석 실행", type="primary", use_container_width=True)
 
     if not analyze_btn:
@@ -258,17 +313,54 @@ def main():
         st.error("시작일은 종료일보다 이전이어야 합니다.")
         return
 
-    # 분석 실행
+    # 분석 실행 (yfinance일 때 거래량까지 받으면 QuantFormer 등에 turnover 입력으로 사용)
+    volumes = None
     with st.spinner("데이터를 불러오는 중..."):
         try:
-            prices = download_data(
-                tickers, start_str, end_str, provider=provider, api_keys=api_keys
-            )
+            if provider == "yfinance":
+                try:
+                    prices, volumes = download_data_with_volume(
+                        tickers,
+                        start_str,
+                        end_str,
+                        provider=provider,
+                        api_keys=api_keys,
+                        use_local_store=use_local_store,
+                        store_path=store_path,
+                        force_refresh=force_refresh,
+                    )
+                except Exception:
+                    prices = download_data(
+                        tickers,
+                        start_str,
+                        end_str,
+                        provider=provider,
+                        api_keys=api_keys,
+                        use_local_store=use_local_store,
+                        store_path=store_path,
+                        force_refresh=force_refresh,
+                    )
+                    volumes = None
+            else:
+                prices = download_data(
+                    tickers,
+                    start_str,
+                    end_str,
+                    provider=provider,
+                    api_keys=api_keys,
+                    use_local_store=use_local_store,
+                    store_path=store_path,
+                    force_refresh=force_refresh,
+                )
         except (ValueError, ConnectionError) as e:
             st.error(f"데이터 다운로드 실패: {e}")
             return
 
     st.success(f"데이터 로드 완료: {list(prices.columns)}")
+    if use_local_store:
+        st.caption(f"로컬 저장소: `{store_path}`")
+    if volumes is not None and not volumes.empty:
+        st.caption("거래량 데이터가 함께 로드되었습니다. (QuantFormer·LSTM 등의 turnover 특성에 반영)")
 
     returns = prices.pct_change().dropna()
 
@@ -342,6 +434,130 @@ def main():
         for ticker, res in factor_results.items():
             with st.expander(f"**{ticker}** 회귀 요약"):
                 st.text(res["summary"])
+
+    st.divider()
+    st.header("🔮 주가(수익률) 예측 — 다중 모델")
+    st.caption(
+        "**QuantFormer** (arXiv:2404.00424): 선형 임베딩·위치인코딩 없음·양자화 라벨+MSE. "
+        "**THGNN** (CIKM'22): 동적 상관 그래프+GAT. "
+        "논문 §2에 등장하는 **LSTM/GRU·SVM·Ridge·RF** 등과 규칙 베이스라인을 한 화면에서 선택할 수 있습니다."
+    )
+
+    _desc = prediction_model_descriptions()
+    _ids = prediction_model_ids()
+
+    def _fmt_model(mid: str) -> str:
+        return f"{mid}"
+
+    pred_model = st.selectbox(
+        "예측 모델",
+        options=_ids,
+        format_func=_fmt_model,
+        index=0,
+        help=_desc.get(_ids[0], ""),
+    )
+    st.caption(_desc.get(pred_model, ""))
+
+    need_torch = pred_model in ("quantformer", "thgnn", "lstm", "gru")
+    need_sklearn = pred_model in ("ridge", "svm", "random_forest")
+    if need_torch and not THGNN_DEPS_OK:
+        st.warning("이 모델은 `torch`가 필요합니다. `pip install -r requirements.txt` 후 다시 실행하세요.")
+    if need_sklearn and not SKLEARN_OK:
+        st.warning("이 모델은 `scikit-learn`이 필요합니다. `pip install -r requirements.txt` 후 다시 실행하세요.")
+
+    with st.expander("⚙️ 학습 하이퍼파라미터", expanded=False):
+        pc1, pc2, pc3 = st.columns(3)
+        with pc1:
+            pr_lookback = st.number_input(
+                "lookback / seq_len",
+                min_value=5,
+                max_value=120,
+                value=20,
+                step=1,
+                help="시퀀스 길이 (일). QuantFormer·THGNN·RNN·sklearn 공통에 사용",
+            )
+            pr_train_ratio = st.slider("train_ratio", 0.5, 0.9, 0.7, 0.05)
+            pr_epochs = st.number_input("epochs", 1, 80, 15 if pred_model not in ("thgnn",) else 10, 1)
+        with pc2:
+            pr_lr = st.number_input("lr", min_value=1e-5, max_value=1e-1, value=1e-3, step=1e-4, format="%.5f")
+            pr_hidden = st.number_input("RNN hidden", 8, 128, 32, 8)
+            pr_layers = st.number_input("RNN layers", 1, 3, 1, 1)
+        with pc3:
+            qf_rho = st.selectbox("QuantFormer ϱ (클래스 수)", [3, 5], index=0)
+            qf_phi = st.slider("QuantFormer φ (분위 비율)", 0.1, 0.3, 0.2, 0.05)
+            th_corr_w = st.number_input("THGNN corr_window", 10, 120, 20, 5)
+            th_thr = st.slider("THGNN 상관 threshold", 0.1, 0.95, 0.6, 0.05)
+            th_topk = st.number_input(
+                "THGNN top-k",
+                1,
+                max(1, len(tickers) // 2),
+                min(10, max(1, len(tickers) // 5)),
+                1,
+            )
+
+    run_pred = st.button("🧠 선택 모델 학습 & 예측", use_container_width=True)
+    if run_pred:
+        if (need_torch and not THGNN_DEPS_OK) or (need_sklearn and not SKLEARN_OK):
+            st.error("필수 패키지가 없어 실행할 수 없습니다.")
+        else:
+            kw = {
+                "lookback": int(pr_lookback),
+                "seq_len": int(pr_lookback),
+                "train_ratio": float(pr_train_ratio),
+                "epochs": int(pr_epochs),
+                "lr": float(pr_lr),
+                "hidden": int(pr_hidden),
+                "num_layers": int(pr_layers),
+                "rho": int(qf_rho),
+                "phi": float(qf_phi),
+                "corr_window": int(th_corr_w),
+                "corr_threshold": float(th_thr),
+                "top_k": int(th_topk),
+            }
+            with st.spinner(f"`{pred_model}` 학습 중… (CPU에서는 시간이 걸릴 수 있습니다)"):
+                try:
+                    out = run_stock_prediction(
+                        pred_model,
+                        prices,
+                        volumes,
+                        **kw,
+                    )
+                except Exception as e:
+                    st.error(f"예측 실패: {e}")
+                    out = None
+
+            if out is not None:
+                st.success(f"모델: **{out.get('model_name', pred_model)}**")
+                if "device" in out:
+                    st.caption(f"device={out['device']}")
+
+                tm, vm = out.get("train_metrics"), out.get("test_metrics")
+                if tm:
+                    c1, c2, c3, c4 = st.columns(4)
+                    with c1:
+                        if "loss" in tm and isinstance(tm["loss"], (int, float)) and not np.isnan(tm["loss"]):
+                            st.metric("Train loss/MSE", f"{tm['loss']:.4f}")
+                    with c2:
+                        if "acc" in tm and isinstance(tm["acc"], (int, float)) and not np.isnan(tm["acc"]):
+                            st.metric("Train ACC", f"{tm['acc']:.3f}")
+                    with c3:
+                        if vm and "loss" in vm and isinstance(vm["loss"], (int, float)) and not np.isnan(vm["loss"]):
+                            st.metric("Test loss/MSE", f"{vm['loss']:.4f}")
+                    with c4:
+                        if vm and "acc" in vm and isinstance(vm["acc"], (int, float)) and not np.isnan(vm["acc"]):
+                            st.metric("Test ACC", f"{vm['acc']:.3f}")
+
+                if "test_mse" in out and isinstance(out["test_mse"], (int, float)) and not np.isnan(out["test_mse"]):
+                    st.metric("Test MSE (회귀)", f"{out['test_mse']:.6f}")
+
+                st.subheader("📌 최신 시점 랭킹")
+                pred_s = out["pred"].reset_index()
+                pred_s.columns = ["티커", out["pred"].name or "score"]
+                st.dataframe(pred_s, use_container_width=True, hide_index=True)
+
+                if "proba" in out:
+                    st.subheader("클래스 확률 (QuantFormer)")
+                    st.dataframe(out["proba"], use_container_width=True)
 
     st.divider()
     st.caption("Quantitative Investment Model · 개인 실전 활용")

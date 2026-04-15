@@ -26,7 +26,28 @@ from statsmodels.tools import add_constant
 from data_providers import (
     fetch_prices,
     get_provider_names,
+    normalize_provider_name,
+    validate_provider_api_key,
 )
+from market_data_store import (
+    MarketDataStore,
+)
+
+try:
+    import torch
+
+    from thgnn import (
+        THGNN,
+        THGNNBatch,
+        build_features_from_close,
+        make_daily_batches,
+        train_thgnn,
+        evaluate_batches,
+    )
+
+    THGNN_DEPS_OK = True
+except Exception:
+    THGNN_DEPS_OK = False
 
 
 # =============================================================================
@@ -40,6 +61,10 @@ def download_data(
     end_date: str,
     provider: str = "yfinance",
     api_keys: Optional[dict] = None,
+    *,
+    use_local_store: bool = True,
+    store_path: Optional[str] = None,
+    force_refresh: bool = False,
 ) -> pd.DataFrame:
     """
     지정 기간의 조정 종가(또는 종가)를 선택한 데이터 프로바이더로 다운로드합니다.
@@ -68,12 +93,23 @@ def download_data(
     """
     if not tickers:
         raise ValueError("티커 목록이 비어 있습니다.")
+    provider = normalize_provider_name(provider)
     if provider not in get_provider_names():
         raise ValueError(f"지원하지 않는 프로바이더: {provider}. 사용 가능: {get_provider_names()}")
+    validate_provider_api_key(provider, api_keys)
 
+    store = MarketDataStore(store_path) if use_local_store else None
     dfs = []
     for t in tickers:
-        series = fetch_prices(provider, t, start_date, end_date, api_keys=api_keys)
+        series = _load_or_fetch_close_series(
+            ticker=t,
+            start_date=start_date,
+            end_date=end_date,
+            provider=provider,
+            api_keys=api_keys,
+            store=store,
+            force_refresh=force_refresh,
+        )
         if series is not None and not series.empty:
             series.index = pd.to_datetime(series.index).tz_localize(None)
             dfs.append(series)
@@ -92,6 +128,170 @@ def download_data(
 
     result = result.dropna(axis=1, thresh=int(len(result) * 0.5))
     return result
+
+
+def download_data_with_volume(
+    tickers: list[str],
+    start_date: str,
+    end_date: str,
+    provider: str = "yfinance",
+    api_keys: Optional[dict] = None,
+    *,
+    use_local_store: bool = True,
+    store_path: Optional[str] = None,
+    force_refresh: bool = False,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    종가와 거래량을 같은 캘린더로 정렬해 다운로드합니다.
+
+    QuantFormer 논문의 turnover(회전율) 입력에 거래량을 쓰기 위한 용도입니다.
+    현재는 **yfinance만** 지원합니다. 다른 프로바이더는 ``download_data``만 사용하세요.
+    """
+    if not tickers:
+        raise ValueError("티커 목록이 비어 있습니다.")
+    provider = normalize_provider_name(provider)
+    if provider != "yfinance":
+        raise ValueError(
+            "종가+거래량 동시 수집은 현재 yfinance만 지원합니다. "
+            f"(요청 프로바이더: {provider})"
+        )
+
+    store = MarketDataStore(store_path) if use_local_store else None
+    close_list = []
+    vol_list = []
+    for t in tickers:
+        close_series, volume_series = _load_or_fetch_close_and_volume(
+            ticker=t,
+            start_date=start_date,
+            end_date=end_date,
+            provider=provider,
+            store=store,
+            force_refresh=force_refresh,
+        )
+        if close_series is None or close_series.empty:
+            continue
+        close_list.append(close_series)
+        vol_list.append(volume_series)
+
+    if not close_list:
+        raise ValueError(
+            f"다운로드된 데이터가 없습니다. 티커({tickers}), 날짜({start_date}~{end_date})를 확인하세요."
+        )
+
+    prices = pd.concat(close_list, axis=1)
+    volumes = pd.concat(vol_list, axis=1)
+    volumes = volumes.reindex(columns=prices.columns)
+    prices = prices.dropna(how="all")
+    volumes = volumes.reindex(prices.index)
+    prices = prices.dropna(axis=1, thresh=int(len(prices) * 0.5))
+    volumes = volumes.reindex(columns=prices.columns)
+    return prices, volumes
+
+
+def _load_or_fetch_close_series(
+    *,
+    ticker: str,
+    start_date: str,
+    end_date: str,
+    provider: str,
+    api_keys: Optional[dict],
+    store: Optional[MarketDataStore],
+    force_refresh: bool,
+) -> Optional[pd.Series]:
+    if store and not force_refresh and store.covers_range(provider, ticker, start_date, end_date):
+        cached = store.load_series(provider, ticker, start_date, end_date, field="close")
+        if not cached.empty:
+            return cached
+
+    series = fetch_prices(provider, ticker, start_date, end_date, api_keys=api_keys)
+    if series is None or series.empty:
+        if store:
+            return store.load_series(provider, ticker, start_date, end_date, field="close")
+        return series
+
+    series.index = pd.to_datetime(series.index).tz_localize(None)
+    if store:
+        store.upsert_daily_bars(
+            provider,
+            ticker,
+            pd.DataFrame({"close": series}),
+            source="remote",
+            requested_start=start_date,
+            requested_end=end_date,
+        )
+        return store.load_series(provider, ticker, start_date, end_date, field="close")
+    return series
+
+
+def _load_or_fetch_close_and_volume(
+    *,
+    ticker: str,
+    start_date: str,
+    end_date: str,
+    provider: str,
+    store: Optional[MarketDataStore],
+    force_refresh: bool,
+) -> tuple[Optional[pd.Series], pd.Series]:
+    if store and not force_refresh and store.covers_range(
+        provider, ticker, start_date, end_date, require_volume=True
+    ):
+        cached_close = store.load_series(provider, ticker, start_date, end_date, field="close")
+        cached_volume = store.load_series(provider, ticker, start_date, end_date, field="volume")
+        if not cached_close.empty:
+            if cached_volume.empty:
+                cached_volume = pd.Series(index=cached_close.index, dtype=float, name=ticker)
+            return cached_close, cached_volume.reindex(cached_close.index)
+
+    try:
+        data = yf.download(
+            ticker,
+            start=start_date,
+            end=end_date,
+            progress=False,
+            auto_adjust=True,
+        )
+    except Exception:
+        data = pd.DataFrame()
+
+    if data.empty:
+        if store:
+            cached_close = store.load_series(provider, ticker, start_date, end_date, field="close")
+            cached_volume = store.load_series(provider, ticker, start_date, end_date, field="volume")
+            if cached_volume.empty and not cached_close.empty:
+                cached_volume = pd.Series(index=cached_close.index, dtype=float, name=ticker)
+            return cached_close, cached_volume
+        return None, pd.Series(dtype=float, name=ticker)
+
+    data.index = pd.to_datetime(data.index).tz_localize(None)
+    if "Close" in data.columns:
+        close = data["Close"].copy()
+    else:
+        close = data.iloc[:, 3].copy()
+    close.name = ticker
+
+    if "Volume" in data.columns:
+        volume = data["Volume"].copy().astype(float)
+    else:
+        volume = pd.Series(index=close.index, dtype=float)
+    volume.name = ticker
+
+    if store:
+        frame = pd.DataFrame({"close": close, "volume": volume})
+        store.upsert_daily_bars(
+            provider,
+            ticker,
+            frame,
+            source="remote",
+            requested_start=start_date,
+            requested_end=end_date,
+        )
+        close = store.load_series(provider, ticker, start_date, end_date, field="close")
+        volume = store.load_series(provider, ticker, start_date, end_date, field="volume")
+        if volume.empty:
+            volume = pd.Series(index=close.index, dtype=float, name=ticker)
+        else:
+            volume = volume.reindex(close.index)
+    return close, volume
 
 
 # =============================================================================
@@ -648,3 +848,146 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+
+# =============================================================================
+# 7. THGNN 기반 주가 움직임 예측 (논문 로직 반영)
+# =============================================================================
+
+
+def thgnn_prepare(
+    prices: pd.DataFrame,
+    *,
+    lookback: int = 20,
+    corr_window: int = 20,
+    corr_threshold: float = 0.6,
+    top_k: Optional[int] = None,
+    device: Optional[str] = None,
+) -> dict:
+    """
+    THGNN 학습용 일자별 배치 생성.
+
+    - 입력: 종가 DataFrame (index=날짜, columns=티커)
+    - 출력: torch 배치 리스트 및 메타데이터
+    """
+    if not THGNN_DEPS_OK:
+        raise ImportError("THGNN 실행을 위한 의존성(torch)이 준비되지 않았습니다. requirements.txt를 설치하세요.")
+
+    if prices.shape[1] < 4:
+        raise ValueError("THGNN은 종목 간 관계 학습이 핵심이라 최소 4개 이상 티커를 권장합니다.")
+
+    close = prices.sort_index().astype(float).to_numpy()  # (T, L)
+    feats = build_features_from_close(close)  # (T, L, 6)
+
+    L = prices.shape[1]
+    if top_k is None:
+        top_k = max(1, min(10, L // 5))
+
+    raw_batches = make_daily_batches(
+        feats,
+        close,
+        lookback=lookback,
+        corr_window=corr_window,
+        corr_threshold=corr_threshold,
+        top_k=int(top_k),
+    )
+    if not raw_batches:
+        raise ValueError("THGNN 배치를 만들 수 없습니다. 기간이 너무 짧거나 파라미터가 과도합니다.")
+
+    dev = None
+    if device:
+        dev = torch.device(device)
+    else:
+        dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    batches: list[THGNNBatch] = []
+    for x, A_pos, A_neg, y, mask in raw_batches:
+        batches.append(
+            THGNNBatch(
+                x=torch.tensor(x, dtype=torch.float32),
+                A_pos=torch.tensor(A_pos, dtype=torch.float32),
+                A_neg=torch.tensor(A_neg, dtype=torch.float32),
+                y=torch.tensor(y, dtype=torch.float32),
+                mask=torch.tensor(mask, dtype=torch.float32),
+            )
+        )
+
+    return {
+        "batches": batches,
+        "tickers": list(prices.columns),
+        "dates": list(prices.sort_index().index),
+        "device": dev,
+        "top_k": int(top_k),
+    }
+
+
+def thgnn_train_and_predict(
+    prices: pd.DataFrame,
+    *,
+    lookback: int = 20,
+    corr_window: int = 20,
+    corr_threshold: float = 0.6,
+    top_k: Optional[int] = None,
+    train_ratio: float = 0.7,
+    epochs: int = 10,
+    lr: float = 3e-4,
+    weight_decay: float = 1e-4,
+    seed: int = 42,
+    device: Optional[str] = None,
+) -> dict:
+    """
+    THGNN을 학습하고(간단 train/test split) 마지막 배치 기준 예측 확률을 반환.
+    """
+    if not THGNN_DEPS_OK:
+        raise ImportError("THGNN 실행을 위한 의존성(torch)이 준비되지 않았습니다. requirements.txt를 설치하세요.")
+
+    torch.manual_seed(int(seed))
+    np.random.seed(int(seed))
+
+    prep = thgnn_prepare(
+        prices,
+        lookback=lookback,
+        corr_window=corr_window,
+        corr_threshold=corr_threshold,
+        top_k=top_k,
+        device=device,
+    )
+    batches: list[THGNNBatch] = prep["batches"]
+    dev = prep["device"]
+    tickers = prep["tickers"]
+
+    n = len(batches)
+    split = int(max(1, min(n - 1, round(n * float(train_ratio)))))
+    train_batches = batches[:split]
+    test_batches = batches[split:]
+
+    model = THGNN(feature_dim=6)
+    hist = train_thgnn(
+        model,
+        train_batches=train_batches,
+        valid_batches=test_batches if test_batches else None,
+        device=dev,
+        lr=lr,
+        weight_decay=weight_decay,
+        epochs=epochs,
+    )
+    train_metrics = evaluate_batches(model, train_batches, dev)
+    test_metrics = evaluate_batches(model, test_batches, dev) if test_batches else {"loss": np.nan, "acc": np.nan, "n_days": 0}
+
+    # 마지막 day 배치로 확률 예측
+    last = batches[-1]
+    model.eval()
+    with torch.no_grad():
+        p = model(last.x.to(dev), last.A_pos.to(dev), last.A_neg.to(dev)).detach().cpu().numpy()
+
+    pred = pd.Series(p, index=tickers, name="p(up)")
+    pred = pred.sort_values(ascending=False)
+    return {
+        "model": model,
+        "history": hist,
+        "train_metrics": train_metrics,
+        "test_metrics": test_metrics,
+        "pred": pred,
+        "top_k": prep["top_k"],
+        "device": str(dev),
+    }

@@ -21,6 +21,11 @@ ENV/
 # Output
 *.png
 quant_investing_results.png
+data/*.db
+data/*.sqlite
+data/*.sqlite3
+data/*.sqlite-wal
+data/*.sqlite-shm
 
 # OS
 .DS_Store

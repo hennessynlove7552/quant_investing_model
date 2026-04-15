@@ -33,17 +33,58 @@ PROVIDER_ENV_KEYS = {
     "databento": "DATABENTO_API_KEY",
 }
 
+PROVIDER_ALIASES = {
+    "alpha": "alpha_vantage",
+    "alphavantage": "alpha_vantage",
+    "fmp": "financial_modeling_prep",
+    "financialmodelingprep": "financial_modeling_prep",
+}
+
 
 def get_provider_names() -> list[str]:
     """지원하는 프로바이더 이름 목록."""
     return list(PROVIDER_ENV_KEYS.keys())
 
 
+def normalize_provider_name(provider: str) -> str:
+    """프로바이더 별칭을 정규 이름으로 변환합니다."""
+    return PROVIDER_ALIASES.get(provider, provider)
+
+
+def get_provider_env_key(provider: str) -> Optional[str]:
+    """프로바이더에 대응하는 환경 변수명을 반환합니다."""
+    provider = normalize_provider_name(provider)
+    return PROVIDER_ENV_KEYS.get(provider)
+
+
 def _get_api_key(provider: str, api_keys: Optional[dict] = None) -> Optional[str]:
-    if api_keys and provider in api_keys:
-        return api_keys[provider]
+    provider = normalize_provider_name(provider)
+    if api_keys:
+        if provider in api_keys:
+            return api_keys[provider]
+        for alias, normalized in PROVIDER_ALIASES.items():
+            if normalized == provider and alias in api_keys:
+                return api_keys[alias]
     env_key = PROVIDER_ENV_KEYS.get(provider)
     return os.environ.get(env_key) if env_key else None
+
+
+def validate_provider_api_key(provider: str, api_keys: Optional[dict] = None) -> None:
+    """
+    API 키가 필요한 프로바이더의 설정을 확인합니다.
+
+    키가 없으면 어떤 환경 변수를 설정해야 하는지까지 포함한 메시지를 제공합니다.
+    """
+    provider = normalize_provider_name(provider)
+    env_key = get_provider_env_key(provider)
+    if env_key is None:
+        return
+    if _get_api_key(provider, api_keys):
+        return
+    raise ValueError(
+        f"`{provider}` 사용에는 API 키가 필요합니다. "
+        f"사이드바 입력창에 키를 넣거나 환경 변수 `{env_key}` 를 설정하세요."
+    )
 
 
 def _fetch_yfinance(ticker: str, start_date: str, end_date: str, **kwargs) -> Optional[pd.Series]:
@@ -318,6 +359,7 @@ def fetch_prices(
     pd.Series
         인덱스=날짜, 값=종가(또는 조정종가). 실패 시 None.
     """
+    provider = normalize_provider_name(provider)
     if provider not in _FETCHERS:
         return None
     key = _get_api_key(provider, api_keys)
