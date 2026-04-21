@@ -64,6 +64,7 @@ def _safe_import(module_name: str, attr_name: Optional[str] = None) -> Any:
 
 def prediction_model_ids() -> List[str]:
     return [
+        "auto_single",
         "quantformer",
         "thgnn",
         "lstm",
@@ -77,6 +78,7 @@ def prediction_model_ids() -> List[str]:
 
 def prediction_model_descriptions() -> Dict[str, str]:
     return {
+        "auto_single": "Auto(에이전트, 단일티커): Ridge/SVR/RF/LSTM/GRU를 검증 MSE로 비교해 최적 모델로 다음날 수익률/가격 예측",
         "quantformer": "QuantFormer (arXiv:2404.00424): 선형 임베딩·무위치인코딩 Transformer, 양자화 라벨+MSE",
         "thgnn": "THGNN (CIKM'22): 상관 그래프 + Transformer + 이종 GAT + 랭킹 BCE",
         "lstm": "LSTM 회귀: 다음날 수익률 예측 (§2.2.2 맥락)",
@@ -123,6 +125,50 @@ def run_stock_prediction(
         )
 
     try:
+        if mid == "auto_single":
+            train_predict_univariate = _safe_import("ml_predictors", "train_predict_univariate")
+            lookback = _safe_cast(kwargs.get("lookback", 20), int, "lookback")
+            train_ratio = _safe_cast(kwargs.get("train_ratio", 0.7), float, "train_ratio")
+            hidden = _safe_cast(kwargs.get("hidden", 32), int, "hidden")
+            num_layers = _safe_cast(kwargs.get("num_layers", 1), int, "num_layers")
+            epochs = _safe_cast(kwargs.get("epochs", 15), int, "epochs")
+            lr = _safe_cast(kwargs.get("lr", 1e-3), float, "lr")
+            seed = _safe_cast(kwargs.get("seed", 42), int, "seed")
+
+            # 단일티커: prices 컬럼 1개만 허용
+            if prices.shape[1] != 1:
+                raise PredictionHubError("auto_single은 단일 티커(컬럼 1개)만 지원합니다.")
+            sym = prices.columns[0]
+            vol_s = None
+            if volume is not None and not volume.empty:
+                vol_s = volume[sym]
+
+            out = train_predict_univariate(
+                prices[sym],
+                vol_s,
+                model_type="auto",
+                lookback=lookback,
+                hidden=hidden,
+                num_layers=num_layers,
+                epochs=epochs,
+                lr=lr,
+                train_ratio=train_ratio,
+                seed=seed,
+                device=kwargs.get("device"),
+            )
+            return {
+                "model_name": f"AutoSingle({out['model_type']})",
+                "device": out.get("device", "cpu"),
+                "pred": pd.Series({sym: out["pred_next_return"]}, name="pred_return"),
+                "single": out,
+                "train_metrics": {"loss": float("nan")},
+                "test_metrics": {
+                    "loss": out["test_metrics"]["mse"],
+                    "acc": out["test_metrics"]["dir_acc"],
+                },
+                "test_mse": out["test_metrics"]["mse"],
+            }
+
         if mid == "linear_momentum":
             train_predict_linear_return = _safe_import("ml_predictors", "train_predict_linear_return")
             lookback = _safe_cast(kwargs.get("lookback", 5), int, "lookback")

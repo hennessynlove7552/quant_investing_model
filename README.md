@@ -1,7 +1,7 @@
 ## Quantitative Investment Model
 
 **본인의 실전 투자 판단을 돕기 위한 올인원 Python/웹 퀀트 툴**입니다.  
-히스토리컬 가격과 팩터 데이터를 자동으로 수집하고, 수익·위험 지표·팩터 노출도를 한 화면에서 확인할 수 있어 **개인이 직접 실전에서 활용**하기 좋게 구성되어 있습니다.
+히스토리컬 가격과 팩터 데이터를 자동으로 수집하고, 수익·위험 지표·팩터 노출도·(선택) 예측 모델을 한 화면에서 확인할 수 있어 **개인이 직접 실전에서 활용**하기 좋게 구성되어 있습니다.
 
 > ⚠️ **면책**  
 > 이 도구는 **투자 자문·매매 권유가 아니며**, 출력 결과에 따른 매수·매도 등 모든 의사결정과 손익은 **사용자 본인 책임**입니다. 과거 데이터와 가정에 기반한 분석일 뿐, 미래 수익을 보장하지 않습니다.
@@ -13,6 +13,8 @@
 - **실전에서 바로 쓰는 지표**: **변동성·샤프 비율·최대 낙폭·VaR·Fama‑French 팩터**를 한 앱에서 계산해, 종목·기간 비교와 리스크 점검에 활용할 수 있습니다.
 - **현실 수익률 비교(선택)**: **거래비용·슬리피지·스프레드·세금**을 넣으면 세후·비용 반영 수익률과 샤프 비율로, 실제 수익에 가까운 비교가 가능합니다.
 - **다양한 데이터 소스**: yfinance 외 Alpha Vantage, FMP, EODHD, Polygon, Finnhub 등 여러 프로바이더를 골라 쓰며, 티커·기간만 지정하면 자동으로 수집합니다.
+- **티커 검색/선택(웹)**: Yahoo Finance 심볼 검색을 통해 **사용자가 직접 티커를 검색해서 선택**할 수 있습니다. (`AAPL`, `SPY`, `005930.KS`, `BTC-USD` 등)
+- **AI 에이전트 예측(선택)**: 단일 티커 기준으로 Ridge/SVR/RF/LSTM/GRU 후보를 학습·검증해 **가장 성능이 좋은 모델을 자동 선택(auto)**하고 다음 거래일 수익률/가격을 예측합니다.
 - **웹 + CLI**: 브라우저에서 대시보드로 쓰거나, 터미널/스크립트로 반복 분석·자동화할 수 있습니다.
 - **개인 맞춤 확장**: 함수 단위 구조로, 본인 전략·팩터·포트폴리오 로직을 붙여 **나만의 실전 툴**로 확장하기 좋습니다.
 
@@ -81,13 +83,16 @@
 ### 5. 웹 기반 대시보드
 
 - **Streamlit** 기반 모던 웹 UI
-  - 사이드바에서 티커, 날짜, 무위험 수익률, **비용·세금·미시구조(선택)**, VaR 옵션, 팩터 모델 옵션을 직관적으로 설정
+  - 사이드바에서 **Yahoo 티커 검색/선택 + 직접 입력**, 날짜, 무위험 수익률, **비용·세금·미시구조(선택)**, VaR 옵션, 팩터 모델 옵션을 직관적으로 설정
   - 메인 화면에서:
     - 수익률·리스크 요약 테이블
     - VaR 테이블
     - 가격 시계열(기준일=100), 누적 수익률
     - 팩터 β 막대 그래프, 샤프 비율 차트
     - 티커별 Fama‑French 회귀 요약 (접이식 상세보기)
+    - (선택) **주가(수익률) 예측**:  
+      - **`auto_single`(AI 에이전트)**: 티커별로 자동 모델 선택 → 오차/정확도 지표 + 테스트구간 예측 시각화 + **다음 거래일 예측**  
+      - 기존 다중자산 랭킹 기반 모델(QuantFormer/THGNN/전통 ML/RNN 등)도 선택 가능
 - 별도의 자바스크립트/프론트엔드 없이 **순수 Python 코드만으로 웹 리포트 구현**
 
 ### 6. CLI(커맨드라인) 분석 모드
@@ -107,7 +112,11 @@
 pip install -r requirements.txt
 ```
 
-또는 개별 설치:
+옵션 패키지(예측 모델에 따라 필요):
+- `torch`: LSTM/GRU 및 일부 딥러닝 모델에 필요
+- `scikit-learn`: Ridge/SVR/RF 등 전통 ML 모델에 필요
+
+또는 최소 개별 설치(웹 + 기본 분석):
 
 ```bash
 pip install pandas numpy matplotlib yfinance statsmodels streamlit requests
@@ -128,6 +137,18 @@ chmod +x run_app.sh
 
 브라우저에서 `http://localhost:8501` 로 접속합니다.
 
+### 2-1) 같은 와이파이에서 접속(선택)
+
+```bash
+streamlit run app.py --server.address 0.0.0.0 --server.port 8501
+```
+
+그 다음 다른 기기에서 `http://<내IP>:8501` 로 접속합니다. (내 IP 확인: `ipconfig getifaddr en0`)
+
+### 2-2) 인터넷 공개 링크(선택)
+
+- 가장 간단한 방법(터널): Cloudflare Tunnel 또는 ngrok를 사용하면 외부에서 접속 가능한 `https://...` 링크를 만들 수 있습니다.
+
 ### 3) CLI 실행
 
 ```bash
@@ -136,34 +157,29 @@ python quant_investing_model.py
 
 ---
 
-## 배포 (Streamlit Community Cloud 권장)
+## 배포/공개 링크
 
-**공개 링크(예: `https://xxx.streamlit.app`)**를 만들려면 Streamlit Cloud에 배포하면 됩니다.
+목표에 따라 아래 중 하나를 선택합니다.
 
-### 1) GitHub 레포 준비
+### A) Streamlit Community Cloud (권장: 고정 URL)
 
-- 현재 레포에는 웹 엔트리 파일이 `app.py`로 준비되어 있습니다.
-- 배포 환경용 파이썬 버전은 `runtime.txt`로 고정되어 있습니다.
-- 의존성은 `requirements.txt`로 설치됩니다.
-- API 키는 **Streamlit Secrets** 또는 배포 환경 변수로 넣는 것을 권장합니다.  
-  (로컬처럼 `.env`/직접 입력은 배포에서 안전하지 않을 수 있습니다.)
+- **Main file path**: `app.py`
+- **Dependencies**: `requirements.txt`
+- 외부 프로바이더 키는 Streamlit의 **Secrets/환경변수**로 설정 권장
 
-### 2) Streamlit Cloud에서 배포
+### B) 터널(Cloudflare/ngrok) (권장: 가장 빠르게 공개)
 
-1. Streamlit Cloud 접속: `https://streamlit.io/cloud`
-2. GitHub 로그인 후 **New app** 생성
-3. Repository: `hennessynlove7552/quant_investing_model`
-4. Branch: `main`
-5. Main file path: `app.py`
-6. Deploy 클릭
+- 로컬에서 실행 중인 `http://localhost:8501`을 외부로 노출해 **즉시 접속 링크**를 발급합니다.
 
-배포가 완료되면 Streamlit Cloud가 **접속 링크**를 발급합니다.
+### C) VPS/리버스프록시 (권장: 운영/보안/HTTPS 세팅)
 
-### 3) (중요) API 키/시크릿 설정
+- 고정 도메인/HTTPS/인증 등을 제대로 붙이고 싶다면 VPS + Caddy/Nginx + systemd 구성을 권장합니다.
+
+### (중요) API 키/시크릿
 
 `yfinance` 외 프로바이더(Alpha Vantage, FMP, EODHD, Polygon, Finnhub, Barchart, Databento 등)는 API 키가 필요할 수 있습니다.
 
-- Streamlit Cloud의 App settings → **Secrets**에 다음 형식으로 저장:
+- 배포 환경에서는 **Secrets/환경변수**에 다음 형식으로 저장:
 
 ```toml
 ALPHAVANTAGE_API_KEY = "..."
@@ -182,13 +198,14 @@ DATABENTO_API_KEY = "..."
 
 ## 예시 워크플로우
 
-1. **티커 입력**: `AAPL, MSFT, SPY`
+1. **티커 선택**: 검색으로 선택 + 필요 시 직접 입력 (예: `AAPL`, `MSFT`, `SPY`, `005930.KS`)
 2. **기간 설정**: `2020-01-01` ~ `2024-12-31`
 3. **무위험 수익률**: `0.03` (3%)
 4. **옵션 선택**:
    - 비용·세금 반영: 거래비용 0.1%, 슬리피지 0.05%, 세율 25% 등 (선택)
    - VaR 계산: ON, 신뢰수준 95%
    - Fama‑French 3‑팩터 분석: ON
+   - (선택) 예측 모델: **`auto_single`** (AI 에이전트, 단일티커)
 5. **결과 해석**:
    - 어떤 자산이 높은 **위험 대비 보상(샤프 비율)** 을 갖는지 비교
    - **최대 낙폭**을 통해 하락장 민감도 파악

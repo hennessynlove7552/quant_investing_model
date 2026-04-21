@@ -40,6 +40,207 @@ def _panels(
     return close, ret.astype(np.float32), v
 
 
+def _train_test_split_time(
+    X: np.ndarray, y: np.ndarray, train_ratio: float
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    if not (0.3 < float(train_ratio) < 0.95):
+        raise ValueError(f"train_ratio out of range: {train_ratio}")
+    n = len(X)
+    if n < 10:
+        raise ValueError(f"not enough samples: {n}")
+    split = int(n * float(train_ratio))
+    split = max(5, min(n - 3, split))
+    return X[:split], y[:split], X[split:], y[split:]
+
+
+def _directional_accuracy(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+    yt = np.asarray(y_true, dtype=np.float64)
+    yp = np.asarray(y_pred, dtype=np.float64)
+    m = np.isfinite(yt) & np.isfinite(yp)
+    if m.sum() == 0:
+        return float("nan")
+    return float(np.mean(np.sign(yt[m]) == np.sign(yp[m])))
+
+
+def _mape(y_true: np.ndarray, y_pred: np.ndarray, eps: float = 1e-12) -> float:
+    yt = np.asarray(y_true, dtype=np.float64)
+    yp = np.asarray(y_pred, dtype=np.float64)
+    m = np.isfinite(yt) & np.isfinite(yp)
+    if m.sum() == 0:
+        return float("nan")
+    denom = np.maximum(np.abs(yt[m]), eps)
+    return float(np.mean(np.abs((yt[m] - yp[m]) / denom)))
+
+
+def build_univariate_return_dataset(
+    prices_1: pd.Series,
+    volume_1: Optional[pd.Series],
+    lookback: int,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    단일 티커용 데이터셋.
+    X: (N, lookback, 2)  [ret, turnover] zscore
+    y: (N,) next-day return
+    close: (T,) 종가 (예측 가격 계산용)
+    """
+    prices_df = prices_1.to_frame("x")
+    vol_df = volume_1.to_frame("x") if volume_1 is not None else None
+    close, ret, v = _panels(prices_df, vol_df, lookback)
+    close = close[:, 0].astype(np.float64)
+    r = ret[:, 0].astype(np.float64)
+    vv = v[:, 0].astype(np.float64)
+
+    Xs, ys = [], []
+    T = len(r)
+    for t in range(lookback, T - 1):
+        rw = r[t - lookback : t]
+        vw = vv[t - lookback : t]
+        x2 = np.stack([rw, vw], axis=-1).astype(np.float32)
+        x2 = zscore_timesteps(x2.reshape(1, lookback, 2)).reshape(lookback, 2)
+        nxt = r[t + 1]
+        if not np.isfinite(nxt) or not np.all(np.isfinite(x2)):
+            continue
+        Xs.append(x2)
+        ys.append(float(nxt))
+    if len(Xs) < 20:
+        raise ValueError(f"학습 샘플이 너무 적습니다 ({len(Xs)}개). 기간을 늘려주세요.")
+    return np.stack(Xs, axis=0), np.asarray(ys, dtype=np.float32), close
+
+
+def train_predict_univariate(
+    prices_1: pd.Series,
+    volume_1: Optional[pd.Series],
+    *,
+    model_type: str = "auto",
+    lookback: int = 20,
+    hidden: int = 32,
+    num_layers: int = 1,
+    epochs: int = 15,
+    lr: float = 1e-3,
+    train_ratio: float = 0.7,
+    seed: int = 42,
+    device: Optional[str] = None,
+) -> dict:
+    """
+    단일 티커 다음 거래일 수익률 예측 + 테스트 지표/시각화용 시계열 반환.
+    model_type: auto | ridge | svm | rf | lstm | gru
+    """
+    mt = (model_type or "auto").strip().lower().replace(" ", "_")
+    X, y, close = build_univariate_return_dataset(prices_1, volume_1, lookback)
+    Xtr, ytr, Xte, yte = _train_test_split_time(X, y, train_ratio=train_ratio)
+
+    chosen = mt
+    best = None
+
+    def _fit_eval_one(m: str) -> dict:
+        if m in ("ridge", "svm", "rf"):
+            from sklearn.ensemble import RandomForestRegressor
+            from sklearn.linear_model import Ridge
+            from sklearn.pipeline import make_pipeline
+            from sklearn.preprocessing import StandardScaler
+            from sklearn.svm import SVR
+
+            Xtr2 = Xtr.reshape(len(Xtr), -1)
+            Xte2 = Xte.reshape(len(Xte), -1)
+            if m == "ridge":
+                model = make_pipeline(StandardScaler(), Ridge(alpha=1.0, random_state=seed))
+            elif m == "svm":
+                model = make_pipeline(StandardScaler(), SVR(kernel="rbf", C=1.0, epsilon=0.01))
+            else:
+                model = RandomForestRegressor(
+                    n_estimators=100, max_depth=10, random_state=seed, n_jobs=-1
+                )
+            model.fit(Xtr2, ytr)
+            pred_te = model.predict(Xte2).astype(np.float64)
+            pred_next = float(model.predict(X[-1:].reshape(1, -1))[0])
+            return {
+                "model": model,
+                "pred_test": pred_te,
+                "pred_next_return": pred_next,
+                "device": "cpu",
+            }
+
+        if m in ("lstm", "gru"):
+            torch.manual_seed(seed)
+            dev = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
+            model = _SeqRegressor(m, in_dim=2, hidden=hidden, num_layers=num_layers).to(dev)
+            opt = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-4)
+            Xtr_t = torch.tensor(Xtr, dtype=torch.float32, device=dev)
+            ytr_t = torch.tensor(ytr, dtype=torch.float32, device=dev)
+            Xte_t = torch.tensor(Xte, dtype=torch.float32, device=dev)
+            model.train()
+            for _ in range(int(epochs)):
+                opt.zero_grad(set_to_none=True)
+                pred = model(Xtr_t)
+                loss = nn.functional.mse_loss(pred, ytr_t)
+                loss.backward()
+                nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                opt.step()
+            model.eval()
+            with torch.no_grad():
+                pred_te = model(Xte_t).detach().cpu().numpy().astype(np.float64)
+                pred_next = float(
+                    model(torch.tensor(X[-1:], dtype=torch.float32, device=dev)).cpu().item()
+                )
+            return {
+                "model": model,
+                "pred_test": pred_te,
+                "pred_next_return": pred_next,
+                "device": str(dev),
+            }
+
+        raise ValueError(f"unknown model_type: {m}")
+
+    if chosen == "auto":
+        # 간단한 에이전트: 후보들을 검증(=test) MSE로 비교 후 최적 선택
+        candidates = ["ridge", "svm", "rf", "lstm", "gru"]
+        for c in candidates:
+            try:
+                out = _fit_eval_one(c)
+                mse = float(np.mean((out["pred_test"] - yte.astype(np.float64)) ** 2))
+                payload = {"candidate": c, "mse": mse, **out}
+                if best is None or mse < best["mse"]:
+                    best = payload
+            except Exception:
+                continue
+        if best is None:
+            raise ValueError("auto 모델 선택 실패(후보 학습 실패). sklearn/torch 설치 상태를 확인하세요.")
+        chosen = best["candidate"]
+        fit = best
+    else:
+        fit = _fit_eval_one(chosen)
+
+    yte64 = yte.astype(np.float64)
+    pred_te64 = fit["pred_test"].astype(np.float64)
+    mse = float(np.mean((pred_te64 - yte64) ** 2))
+    mae = float(np.mean(np.abs(pred_te64 - yte64)))
+    mape = _mape(yte64, pred_te64)
+    acc = _directional_accuracy(yte64, pred_te64)
+
+    last_close = float(np.asarray(prices_1.sort_index().astype(float).to_numpy())[-1])
+    pred_next_ret = float(fit["pred_next_return"])
+    pred_next_price = float(last_close * (1.0 + pred_next_ret))
+
+    return {
+        "model_type": chosen,
+        "model": fit["model"],
+        "device": fit.get("device", "cpu"),
+        "lookback": int(lookback),
+        "train_ratio": float(train_ratio),
+        "test_metrics": {
+            "mse": mse,
+            "mae": mae,
+            "mape": mape,
+            "dir_acc": acc,
+        },
+        "y_test": yte64,
+        "y_pred_test": pred_te64,
+        "pred_next_return": pred_next_ret,
+        "pred_next_price": pred_next_price,
+        "last_close": last_close,
+    }
+
+
 def build_sklearn_dataset(
     prices: pd.DataFrame,
     volume: Optional[pd.DataFrame],

@@ -163,7 +163,7 @@ class THGNNBatch:
     """
     하루(t) 단위 배치.
     - x: (L, P, F)
-    - A_pos/A_neg: (L, L)
+    - A_pos/A_neg: (P, L, L) # lookback 기간의 relation graph sequence
     - y/mask: (L,)
     """
 
@@ -207,11 +207,18 @@ class TemporalEncoder(nn.Module):
 
 class GATRelation(nn.Module):
     """
-    단일 관계(예: positive 또는 negative)용 GAT.
-    adjacency가 희소하지만 여기서는 L이 크지 않다는 가정으로 dense mask로 구현.
+    단일 관계(positive 또는 negative)용 temporal GAT.
+
+    기존 구현: 
+    - 하루치 adjacency (L, L) 한 장만 사용
+
+    수정 구현:
+    - lookback 기간의 adjacency sequence (P, L, L)를 사용
+    - 각 시점별로 graph attention aggregation 수행 
+    - 이후 최근 시점에 더 큰 가중치를 부여하는 temporal attention으로 결합
     """
 
-    def __init__(self, in_dim: int, out_dim: int = 256, n_heads: int = 4, dropout: float = 0.1):
+    def __init__(self, in_dim: int, out_dim: int = 256, n_heads: int = 4, dropout: float = 0.1, use_learnable_time_decay: bool = True,):
         super().__init__()
         self.n_heads = n_heads
         self.out_dim = out_dim
@@ -222,19 +229,53 @@ class GATRelation(nn.Module):
         self.W = nn.Linear(in_dim, out_dim, bias=False)
         self.attn = nn.Parameter(torch.empty(n_heads, 2 * self.head_dim))
         nn.init.xavier_uniform_(self.attn)
+
         self.leaky_relu = nn.LeakyReLU(0.2)
         self.dropout = nn.Dropout(dropout)
         self.out_proj = nn.Linear(out_dim, out_dim, bias=True)
 
-    def forward(self, h: torch.Tensor, A: torch.Tensor) -> torch.Tensor:
+        self.use_learnable_time_decay = use_learnable_time_decay
+        if use_learnable_time_decay:
+            # forward에서 실제 P 길이에 맞춰 잘라 씁니다.
+            self.max_time_steps = 512
+            self.time_logits = nn.Parameter(torch.zeros(self.max_time_steps))
+
+    def _single_snapshot_attention(self, Wh: torch.Tensor, A_t: torch.Tensor) -> torch.Tensor:
         """
-        h: (L, D_in)
-        A: (L, L) in {0,1}
-        return: (L, D_out)
+        Wh: (L, H, Hd)
+        A_t: (L, L)
+        return: (L, out_dim)
         """
-        L, _ = h.shape
-        Wh = self.W(h)  # (L, out_dim)
-        Wh = Wh.view(L, self.n_heads, self.head_dim)  # (L, H, Hd)
+        L, _ = Wh.shape[0]
+
+        Wh_j = Wh.unsqueeze(1) # (L, 1, H, Hd)
+        Wh_j = Wh.unsqueeze(0) # (1, L, H, Hd)
+
+        cat = torch.cat([Wh_j.expand(L, L, -1, -1), Wh_j.expand(L, L, -1, -1)], dim=-1)  # (L, L, H, 2Hd)
+        e = (cat * self.attn.unsqueeze(0).unsqueeze(0)).sum(dim=-1)  # (L, L, H)
+        e = self.leaky_relu(e)
+
+        mask = (A_t > 0).unsqueeze(-1)  # (L, L, 1)
+        e = e.masked_fill(~mask, float("-inf"))
+
+        alpha = torch.softmax(e, dim=1)  # (L, L, H)
+        alpha = torch.nan_to_num(alpha, nan=0.0, posinf=0.0, neginf=0.0)
+        alpha = self.dropout(alpha) 
+
+        out_t = torch.einsum("ijh,jhd->ihd", alpha, Wh)  # (L, H, Hd)
+        out_t = out_t.reshape(L, self.out_dim)
+        return out_t
+
+    def _temporal_weights(self, P: int, device: torch.device) -> torch.Tensor:
+        """
+        return: (P,)
+        최근 시점일수록 더 큰 가중치를 주는 temporal weight
+        """
+        if self.use_learnable_time_decay:
+            if P > self.max_time_steps:
+                raise ValueError(f"lookback={P}가 max_time_steps={self.max_time_steps}보다 큽니다.")
+            logits = self.time_logits[:P]  # (P,)
+            return torch.softmax(logits, dim=0) 
 
         # e_ij 계산: a^T [Wh_i || Wh_j]
         # dense로 만들되 adjacency로 마스킹

@@ -14,6 +14,8 @@ import numpy as np
 import matplotlib
 matplotlib.use("Agg")  # headless 백엔드
 import matplotlib.pyplot as plt
+import requests
+from datetime import datetime, timedelta
 
 try:
     from data_providers import (
@@ -151,6 +153,82 @@ def render_sharpe_chart(metrics: pd.DataFrame):
     return fig
 
 
+@st.cache_data(ttl=60 * 10, show_spinner=False)
+def yahoo_symbol_search(query: str, *, quotes_count: int = 12) -> pd.DataFrame:
+    """
+    Yahoo Finance symbol search.
+    반환 컬럼 예: symbol, shortname, longname, exchDisp, typeDisp
+    """
+    q = (query or "").strip()
+    if len(q) < 1:
+        return pd.DataFrame(columns=["symbol", "shortname", "longname", "exchDisp", "typeDisp"])
+    url = "https://query2.finance.yahoo.com/v1/finance/search"
+    params = {"q": q, "quotesCount": int(quotes_count), "newsCount": 0}
+    r = requests.get(url, params=params, timeout=10)
+    r.raise_for_status()
+    js = r.json() or {}
+    quotes = js.get("quotes") or []
+    rows = []
+    for it in quotes:
+        sym = it.get("symbol")
+        if not sym:
+            continue
+        rows.append(
+            {
+                "symbol": sym,
+                "shortname": it.get("shortname") or "",
+                "longname": it.get("longname") or "",
+                "exchDisp": it.get("exchDisp") or "",
+                "typeDisp": it.get("typeDisp") or "",
+            }
+        )
+    df = pd.DataFrame(rows)
+    if df.empty:
+        return pd.DataFrame(columns=["symbol", "shortname", "longname", "exchDisp", "typeDisp"])
+    return df.drop_duplicates(subset=["symbol"]).reset_index(drop=True)
+
+
+def _render_auto_single_result(ticker: str, out: dict, prices_1: pd.Series):
+    single = out.get("single") or {}
+    tm = single.get("test_metrics") or {}
+    pred_next_ret = single.get("pred_next_return", np.nan)
+    pred_next_price = single.get("pred_next_price", np.nan)
+
+    st.markdown(f"#### {ticker}")
+    c0, c1, c2, c3, c4 = st.columns([2, 1, 1, 1, 1])
+    with c0:
+        st.caption(f"선택 모델: `{single.get('model_type', 'unknown')}`  · device={out.get('device', '-')}")
+    with c1:
+        if np.isfinite(tm.get("mse", np.nan)):
+            st.metric("MSE", f"{tm['mse']:.6f}")
+    with c2:
+        if np.isfinite(tm.get("mae", np.nan)):
+            st.metric("MAE", f"{tm['mae']:.6f}")
+    with c3:
+        if np.isfinite(tm.get("mape", np.nan)):
+            st.metric("MAPE", f"{tm['mape']:.3%}")
+    with c4:
+        if np.isfinite(tm.get("dir_acc", np.nan)):
+            st.metric("방향 정확도", f"{tm['dir_acc']:.3f}")
+
+    p1, p2, p3 = st.columns(3)
+    with p1:
+        if np.isfinite(pred_next_ret):
+            st.metric("다음 거래일 예측 수익률", f"{float(pred_next_ret):.3%}")
+    with p2:
+        if np.isfinite(pred_next_price):
+            st.metric("다음 거래일 예측 종가(근사)", f"{float(pred_next_price):,.2f}")
+    with p3:
+        last_close = float(np.asarray(prices_1.sort_index().astype(float).to_numpy())[-1])
+        st.metric("최근 종가", f"{last_close:,.2f}")
+
+    y_true = single.get("y_test")
+    y_hat = single.get("y_pred_test")
+    if y_true is not None and y_hat is not None and len(y_true) == len(y_hat) and len(y_true) > 3:
+        dft = pd.DataFrame({"test_true_ret": y_true, "test_pred_ret": y_hat})
+        st.line_chart(dft, use_container_width=True)
+
+
 def main():
     if not DEPS_OK:
         st.error(
@@ -193,12 +271,38 @@ def main():
             elif provider_env_key:
                 st.caption(f"입력값이 없으면 `{provider_env_key}` 환경 변수를 사용합니다.")
 
-        ticker_input = st.text_input(
-            "자산 티커 (쉼표 구분)",
-            value="AAPL, MSFT, SPY",
-            help="예: AAPL, MSFT, SPY, QQQ",
+        st.subheader("🔎 티커 검색/선택 (Yahoo Finance)")
+        q = st.text_input("티커/회사명 검색", value="AAPL", help="예: AAPL, MSFT, SPY, 005930.KS, BTC-USD")
+        search_df = pd.DataFrame()
+        search_error = None
+        try:
+            search_df = yahoo_symbol_search(q)
+        except Exception as e:
+            search_error = e
+
+        if search_error:
+            st.caption(f"검색 실패(네트워크/제한 등): {search_error}")
+        if not search_df.empty:
+            opt = [
+                f"{row['symbol']} — {row['shortname'] or row['longname']}".strip(" —")
+                + (f" ({row['exchDisp']})" if row.get("exchDisp") else "")
+                for _, row in search_df.iterrows()
+            ]
+            default_pick = opt[: min(3, len(opt))]
+            picked = st.multiselect("검색 결과에서 선택", options=opt, default=default_pick)
+            picked_symbols = [p.split(" — ", 1)[0].strip().upper() for p in picked]
+        else:
+            picked_symbols = []
+
+        manual = st.text_input(
+            "직접 입력 (쉼표 구분, 선택사항)",
+            value="SPY, QQQ",
+            help="예: AAPL, MSFT, 005930.KS(삼성전자), 000660.KS, ^GSPC, BTC-USD",
         )
-        tickers = [t.strip().upper() for t in ticker_input.split(",") if t.strip()]
+        manual_symbols = [t.strip().upper() for t in (manual or "").split(",") if t.strip()]
+        tickers = sorted(set(picked_symbols + manual_symbols))
+        if tickers:
+            st.caption(f"선택된 티커: {', '.join(tickers)}")
 
         col1, col2 = st.columns(2)
         with col1:
@@ -514,50 +618,79 @@ def main():
                 "corr_threshold": float(th_thr),
                 "top_k": int(th_topk),
             }
-            with st.spinner(f"`{pred_model}` 학습 중… (CPU에서는 시간이 걸릴 수 있습니다)"):
-                try:
-                    out = run_stock_prediction(
-                        pred_model,
-                        prices,
-                        volumes,
-                        **kw,
-                    )
-                except Exception as e:
-                    st.error(f"예측 실패: {e}")
-                    out = None
+            if pred_model == "auto_single":
+                st.subheader("🤖 AI 에이전트(단일티커): 티커별 자동 모델 선택")
+                st.caption("각 티커에 대해 Ridge/SVR/RF/LSTM/GRU 후보를 비교해 검증 MSE가 가장 낮은 모델을 자동 선택합니다.")
+                for t in tickers:
+                    if t not in prices.columns:
+                        st.warning(f"{t}: 가격 데이터가 없어 건너뜁니다.")
+                        continue
+                    p1 = prices[t].dropna()
+                    v1 = None
+                    if volumes is not None and not volumes.empty and t in volumes.columns:
+                        v1 = volumes[t].dropna()
+                    with st.spinner(f"{t}: auto_single 학습/예측 중…"):
+                        try:
+                            out = run_stock_prediction(
+                                "auto_single",
+                                p1.to_frame(t),
+                                v1.to_frame(t) if v1 is not None else None,
+                                lookback=int(pr_lookback),
+                                train_ratio=float(pr_train_ratio),
+                                epochs=int(pr_epochs),
+                                lr=float(pr_lr),
+                                hidden=int(pr_hidden),
+                                num_layers=int(pr_layers),
+                            )
+                            with st.container(border=True):
+                                _render_auto_single_result(t, out, p1)
+                        except Exception as e:
+                            st.error(f"{t}: 예측 실패: {e}")
+            else:
+                with st.spinner(f"`{pred_model}` 학습 중… (CPU에서는 시간이 걸릴 수 있습니다)"):
+                    try:
+                        out = run_stock_prediction(
+                            pred_model,
+                            prices,
+                            volumes,
+                            **kw,
+                        )
+                    except Exception as e:
+                        st.error(f"예측 실패: {e}")
+                        out = None
 
-            if out is not None:
-                st.success(f"모델: **{out.get('model_name', pred_model)}**")
-                if "device" in out:
-                    st.caption(f"device={out['device']}")
+                if out is not None:
+                    st.success(f"모델: **{out.get('model_name', pred_model)}**")
+                    if "device" in out:
+                        st.caption(f"device={out['device']}")
 
-                tm, vm = out.get("train_metrics"), out.get("test_metrics")
-                if tm:
-                    c1, c2, c3, c4 = st.columns(4)
-                    with c1:
-                        if "loss" in tm and isinstance(tm["loss"], (int, float)) and not np.isnan(tm["loss"]):
-                            st.metric("Train loss/MSE", f"{tm['loss']:.4f}")
-                    with c2:
-                        if "acc" in tm and isinstance(tm["acc"], (int, float)) and not np.isnan(tm["acc"]):
-                            st.metric("Train ACC", f"{tm['acc']:.3f}")
-                    with c3:
-                        if vm and "loss" in vm and isinstance(vm["loss"], (int, float)) and not np.isnan(vm["loss"]):
-                            st.metric("Test loss/MSE", f"{vm['loss']:.4f}")
-                    with c4:
-                        if vm and "acc" in vm and isinstance(vm["acc"], (int, float)) and not np.isnan(vm["acc"]):
-                            st.metric("Test ACC", f"{vm['acc']:.3f}")
+                    tm, vm = out.get("train_metrics"), out.get("test_metrics")
+                    if tm:
+                        c1, c2, c3, c4 = st.columns(4)
+                        with c1:
+                            if "loss" in tm and isinstance(tm["loss"], (int, float)) and not np.isnan(tm["loss"]):
+                                st.metric("Train loss/MSE", f"{tm['loss']:.4f}")
+                        with c2:
+                            if "acc" in tm and isinstance(tm["acc"], (int, float)) and not np.isnan(tm["acc"]):
+                                st.metric("Train ACC", f"{tm['acc']:.3f}")
+                        with c3:
+                            if vm and "loss" in vm and isinstance(vm["loss"], (int, float)) and not np.isnan(vm["loss"]):
+                                st.metric("Test loss/MSE", f"{vm['loss']:.4f}")
+                        with c4:
+                            if vm and "acc" in vm and isinstance(vm["acc"], (int, float)) and not np.isnan(vm["acc"]):
+                                st.metric("Test ACC", f"{vm['acc']:.3f}")
 
-                if "test_mse" in out and isinstance(out["test_mse"], (int, float)) and not np.isnan(out["test_mse"]):
-                    st.metric("Test MSE (회귀)", f"{out['test_mse']:.6f}")
+                    if "test_mse" in out and isinstance(out["test_mse"], (int, float)) and not np.isnan(out["test_mse"]):
+                        st.metric("Test MSE (회귀)", f"{out['test_mse']:.6f}")
 
-                st.subheader("📌 최신 시점 랭킹")
-                pred_s = out["pred"].reset_index()
-                pred_s.columns = ["티커", out["pred"].name or "score"]
-                st.dataframe(pred_s, use_container_width=True, hide_index=True)
+                    st.subheader("📌 최신 시점 랭킹")
+                    pred_s = out["pred"].reset_index()
+                    pred_s.columns = ["티커", out["pred"].name or "score"]
+                    st.dataframe(pred_s, use_container_width=True, hide_index=True)
 
-                if "proba" in out:
-                    st.subheader("클래스 확률 (QuantFormer)")
-                    st.dataframe(out["proba"], use_container_width=True)
+                    if "proba" in out:
+                        st.subheader("클래스 확률 (QuantFormer)")
+                        st.dataframe(out["proba"], use_container_width=True)
 
     st.divider()
     st.caption("Quantitative Investment Model · 개인 실전 활용")
