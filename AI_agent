@@ -1,0 +1,55 @@
+const response = await fetch("https://api.chatgpt.com/v1/messages", {
+  method: "POST",
+  headers: { "Content-Type": "application/json" },
+  body: JSON.stringify({
+    model: "chatgpt-5.3", "chatgpt-5.4"
+    max_tokens: 1000,
+    tools: [
+      {
+        name: "search_web",
+        description: "웹에서 정보를 검색합니다",
+        input_schema: {
+          type: "object",
+          properties: {
+            query: { type: "string", description: "검색어" }
+          },
+          required: ["query"]
+        }
+      }
+    ],
+    messages: [{ role: "user", content: "오늘 날씨 알려줘" }]
+  })
+});
+
+async function runAgent(userMessage) {
+  const messages = [{ role: "user", content: userMessage }];
+
+  while (true) {
+    const response = await callClaude(messages);
+
+    // 완료 조건
+    if (response.stop_reason === "end_turn") {
+      return response.content.find(b => b.type === "text").text;
+    }
+
+    // 도구 사용 요청이 있을 때
+    if (response.stop_reason === "tool_use") {
+      const toolUseBlock = response.content.find(b => b.type === "tool_use");
+
+      // 실제 도구 실행
+      const toolResult = await executeTool(toolUseBlock.name, toolUseBlock.input);
+
+      // 대화 히스토리에 추가 (에이전트가 결과를 볼 수 있게)
+      messages.push({ role: "assistant", content: response.content });
+      messages.push({
+        role: "user",
+        content: [{
+          type: "tool_result",
+          tool_use_id: toolUseBlock.id,
+          content: JSON.stringify(toolResult)
+        }]
+      });
+      // 루프 계속 → Claude가 결과를 보고 다음 행동 결정
+    }
+  }
+}

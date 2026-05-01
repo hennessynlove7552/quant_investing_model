@@ -2,7 +2,7 @@
 """
 Quant Investing Model - 전문 대시보드
 
-학습용이지만 충분히 완성도 있는 퀀트 리서치 웹앱.
+참고용이지만 충분히 완성도 있는 퀀트 리서치 웹앱.
 단일 종목의 주가 예측 모델 성과를 분석하고 해석하는 대시보드.
 
 실행: streamlit run dashboard.py
@@ -18,11 +18,24 @@ from datetime import datetime, timedelta
 import warnings
 warnings.filterwarnings("ignore")
 
+DEFAULT_TICKERS = ["AAPL", "MSFT", "GOOGL", "AMZN", "TSLA", "META", "NVDA", "AMD"]
+MODEL_OPTIONS = [
+    "Random Forest",
+    "LSTM",
+    "GRU",
+    "Transformer",
+    "Autoformer",
+    "QuantFormer",
+    "ConvLSTM",
+    "THGNN (Temporal Heterogeneous Graph Neural Network)",
+    "Time Series Prediction",
+]
+
 # ============================================================================
 # 1. Mock Data Generator
 # ============================================================================
 
-def generate_mock_prediction_data(ticker: str = "AAPL", n_days: int = 60):
+def generate_mock_prediction_data(ticker: str = "ticker_name", n_days: int = 60):
     """백테스트 및 예측 결과 mock 데이터 생성"""
     np.random.seed(42)
     dates = pd.date_range(end=datetime.now(), periods=n_days, freq='D')
@@ -46,18 +59,18 @@ def generate_mock_prediction_data(ticker: str = "AAPL", n_days: int = 60):
     }
 
 
-def generate_mock_metrics():
+def generate_mock_metrics(actual: np.ndarray, predicted: np.ndarray):
     """모델 성능 지표 mock 데이터"""
     return {
-        "mae": 0.0087,
-        "rmse": 0.0124,
-        "r2": 0.234,
-        "directional_accuracy": 0.612,
-        "hit_ratio": 0.568,
-        "sharpe_ratio": 0.89,
-        "max_drawdown": -0.156,
-        "train_r2": 0.412,
-        "test_r2": 0.234,
+        "mae": calculate_mae(actual, predicted),
+        "rmse": calculate_rmse(actual, predicted),
+        "r2": calculate_r2(actual, predicted),
+        "directional_accuracy": calculate_directional_accuracy(actual, predicted),
+        "hit_ratio": calculate_hit_ratio(actual, predicted),
+        "sharpe_ratio": calculate_sharpe_ratio(predicted),
+        "max_drawdown": calculate_max_drawdown(predicted),
+        "train_r2": max(0.0, min(0.99, calculate_r2(actual, predicted) + 0.08)),
+        "test_r2": calculate_r2(actual, predicted),
     }
 
 
@@ -80,9 +93,9 @@ def generate_mock_feature_importance():
     }).sort_values("Importance", ascending=False)
 
 
-def generate_mock_latest_predictions(ticker: str = "AAPL", n_stocks: int = 5):
+def generate_mock_latest_predictions(ticker: str = "ticker_name", n_stocks: int = 5):
     """최신 예측 결과 mock 데이터"""
-    tickers = ["AAPL", "MSFT", "GOOGL", "AMZN", "TSLA", "META", "NVDA", "AMD"][:n_stocks]
+    tickers = DEFAULT_TICKERS[:n_stocks]
     predictions = np.random.normal(0.001, 0.008, n_stocks)
     
     return pd.DataFrame({
@@ -90,6 +103,16 @@ def generate_mock_latest_predictions(ticker: str = "AAPL", n_stocks: int = 5):
         "Pred_Return": predictions,
         "Direction": ["↓" if p < -0.002 else "↑" if p > 0.002 else "→" for p in predictions],
     })
+
+
+def get_tickers_from_provider(query: str) -> list[str]:
+    """입력값과 일치하는 mock 티커 목록 반환"""
+    normalized = query.strip().upper()
+    if not normalized:
+        return DEFAULT_TICKERS
+
+    matches = [ticker for ticker in DEFAULT_TICKERS if normalized in ticker]
+    return matches or DEFAULT_TICKERS
 
 
 # ============================================================================
@@ -301,7 +324,7 @@ def plot_feature_importance(feature_imp_df: pd.DataFrame):
         x="Importance",
         y="Feature",
         orientation="h",
-        title="Feature Importance (Random Forest)",
+        title="Feature Importance",
         labels={"Importance": "중요도", "Feature": "피처"},
         color="Importance",
         color_continuous_scale="Blues",
@@ -461,24 +484,32 @@ def main():
     # ============ 사이드바 ============
     with st.sidebar:
         st.header("⚙️ 설정")
-        ticker = st.selectbox("종목 선택", ["AAPL", "MSFT", "GOOGL", "AMZN", "TSLA"])
-        model_name = st.selectbox("모델", ["Random Forest", "LSTM", "QuantFormer"])
+        ticker = DEFAULT_TICKERS[0]
+        # 1단계: 텍스트 입력
+        query = st.text_input("종목 검색", placeholder="분석할 종목의 티커를 입력하세요.")
+        # 2단계: 입력값 기반으로 프로바이더에서 검색 후 선택
+        if query:
+            results = get_tickers_from_provider(query)
+            ticker = st.selectbox("종목 선택", options=results)
+        else:
+            ticker = st.selectbox("종목 선택", options=DEFAULT_TICKERS)
+        model_name = st.selectbox("모델", MODEL_OPTIONS)
         lookback_days = st.slider("분석 기간 (일)", 30, 365, 60)
         
         st.divider()
-        st.info("💡 이 대시보드는 학습용 모델의 성과를 분석하는 도구입니다. 실제 투자 판단에는 추가 검증이 필요합니다.")
+        st.info("💡 이 대시보드는 참고용 모델의 성과를 분석하는 도구입니다. 실제 투자 판단에는 추가 검증이 필요합니다.")
     
     # ============ Mock 데이터 로드 ============
     pred_data = generate_mock_prediction_data(ticker, lookback_days)
-    metrics = generate_mock_metrics()
+    metrics = generate_mock_metrics(
+        pred_data["actual_returns"],
+        pred_data["predicted_returns"],
+    )
     feature_imp = generate_mock_feature_importance()
     latest_preds = generate_mock_latest_predictions(ticker, 5)
     
     # 추가 지표 계산
-    directional_acc = calculate_directional_accuracy(
-        pred_data["actual_returns"],
-        pred_data["predicted_returns"]
-    )
+    directional_acc = metrics["directional_accuracy"]
     
     latest_pred = np.mean(pred_data["predicted_returns"][-5:])
     interp = interpret_prediction(latest_pred)
@@ -620,19 +651,19 @@ def main():
             model_name=model_name,
             target="다음 거래일 수익률 예측",
             features_used=len(feature_imp),
-            train_period="2023-01-01 ~ 2024-06-30",
-            test_period="2024-07-01 ~ 현재"
+            train_period="2023-01-01 ~ 2025-01-01",
+            test_period="2024-01-01 ~ 현재"
         )
     
     with col2:
         st.markdown("**주의사항**")
         st.warning(
-            "⚠️ 본 대시보드는 교육/리서치 목적입니다.\n\n"
+            "⚠️ 본 대시보드는 참고용입니다.\n\n"
             "실제 매매는 다음을 고려하세요:\n"
             "• 추가 기본분석\n"
             "• 리스크 관리\n"
             "• 포트폴리오 다양화\n"
-            "• 전문가 상담"
+            "• 시장 상황 변화\n"
         )
     
     with col3:
@@ -651,7 +682,7 @@ def main():
     # ============ 푸터 ============
     st.divider()
     st.caption(
-        "📊 Quant Research Dashboard | "
+        "📊 AI Based Quantitative Investing | "
         "학습용 머신러닝 모델 분석 도구 | "
         f"마지막 업데이트: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
     )

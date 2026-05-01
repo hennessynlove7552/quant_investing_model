@@ -1,8 +1,5 @@
 """
-논문 QuantFormer §2(Preliminaries)에서 언급되는 ML 기반 예측기 근사 구현.
-
-- LSTM / GRU: 시계열 심층 모델 (Hochreiter & Schmidhuber 1997; Chung et al. 2014)
-- Ridge / SVM / RandomForest: sklearn 회귀·분류 (Kim 2003; Huang et al. 2005 등 맥락)
+ML 기반 주가 예측 모델 구현.
 
 입력: 각 종목별 과거 lookback일의 (일수익률, turnover proxy) 시퀀스를 평탄화하거나
       딥모델에서는 (L, lookback, 2) 텐서로 사용.
